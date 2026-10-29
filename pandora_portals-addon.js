@@ -870,7 +870,7 @@
     panel.innerHTML = `<div class="brief-scroll">
       <div class="tool-head"><b>Portals</b><span>A different place and time of day in every window</span></div>
       <div class="pt-step"><h4><i>1</i>Layout<small>one flat colour = one window</small></h4>
-        <div class="up-src${r ? '' : ' empty'}" data-ptlayout>${r ? `<img src="${thumb(r)}" data-th="${r.id}" alt=""><div><b>${esc(r.name || 'layout')}</b><span>${ready ? `${P.zones.length} window${P.zones.length === 1 ? '' : 's'} found` : 'reading…'}</span></div>` : 'No layout yet'}</div>
+        <div class="up-src${r ? '' : ' empty'}" data-ptlayout>${r ? `<img src="${thumb(r)}" data-th="${r.id}" alt=""><div><b title="${esc(r.name || 'layout')}">${esc(r.name || 'layout')}</b><span>${ready ? `${P.zones.length} window${P.zones.length === 1 ? '' : 's'} found` : 'reading…'}</span></div>` : 'No layout yet'}</div>
         <div class="row" style="margin-top:6px"><button class="btn small" id="ptOpen">Open layout…</button>${r ? '<button class="btn small" id="ptClear" title="Take this layout out of Portals and start with a new one">Remove layout</button>' : ''}</div>
         <div class="hint">Paint each window one flat colour, like your arches picture. Anything that isn’t a flat colour (the stone) is kept exactly as it is.</div>
         ${ready ? `<div class="pt-found">${P.zones.map(z => `<i style="background:${rgb(z.color)}" title="${esc(z.name)}"></i>`).join('')}<button type="button" class="btn small pt-pick${P.picking ? ' on' : ''}" id="ptPick">${P.picking ? 'Click a colour…' : '+ Pick a colour I missed'}</button></div>

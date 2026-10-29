@@ -488,8 +488,9 @@ body.hist-closed .lib-rail{display:flex;flex-direction:column;align-items:center
 
 /* upscale */
 [hidden]{display:none!important}
-.up-src{display:grid;grid-template-columns:64px 1fr;gap:10px;align-items:center;background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-s);padding:6px}
+.up-src{display:grid;grid-template-columns:64px minmax(0,1fr);gap:10px;align-items:center;background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-s);padding:6px}
 .up-src img{width:64px;height:48px;object-fit:cover;border-radius:4px;display:block}
+.up-src>div{min-width:0}
 .up-src b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .up-src span{color:var(--faint);font-size:12px}
 .up-src.empty{display:block;color:var(--faint);text-align:center;padding:14px}
