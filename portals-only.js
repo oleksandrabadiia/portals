@@ -70,5 +70,12 @@
     };
   }
 
+  // open on Portals, and bring back the layout you had open once your saved pictures have loaded
+  const lastLayout = store.get('pandora.portals.src', null);
   setView('portals');
+  if (lastLayout) (async () => {
+    for (let i = 0; i < 200 && !img(lastLayout); i++) await new Promise(r => setTimeout(r, 150));
+    const PP = window.PandoraPortals;
+    if (img(lastLayout) && PP && !PP.P.layoutC && !PP.P.busyMsg && S.view === 'portals') PP.setLayout(lastLayout);
+  })();
 })();

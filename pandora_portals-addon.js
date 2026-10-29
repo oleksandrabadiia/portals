@@ -180,6 +180,7 @@
       const v = sceneOf(z); if (!v) continue;
       if (!EL.get(v)) jobs.push(load(EL, 'p:' + v, async () => createImageBitmap(await getBlob(img(v)))));
       if (metaOf(z, v).over && !MO.get(v)) jobs.push(load(MO, 'o:' + v, async () => { const rec = await DB.run('tilesets', 'readonly', st => st.get('ptover:' + v)); return rec && rec.blob ? fixOver(await createImageBitmap(rec.blob), v) : null; }));
+      jobs.push(loadEdit('b', v), loadEdit('o', v));
       if (metaOf(z, v).kind === 'ctx' && !MK.get(v)) jobs.push(load(MK, 'm:' + v, async () => { const rec = await DB.run('tilesets', 'readonly', st => st.get('ptmask:' + v)); return rec && rec.blob ? createImageBitmap(rec.blob) : null; }));
     }
     await Promise.all(jobs);
@@ -303,6 +304,80 @@
     if (!changed) { CLEAN.set(v, mk); return mk; }
     mg.putImageData(md, 0, 0); CLEAN.set(v, mc); return mc;
   }
+
+  /* ---------------- mask brush: wipe out or paint back parts of a window ---------------- */
+  // 'b:<picture id>' = that window's own mask, 'o:<picture id>' = its things-in-front cut-out. Your edited copy, or false.
+  const EM = new Map(), EMP = new Map();
+  function loadEdit(kind, id) {
+    const key = kind + ':' + id;
+    if (EM.has(key)) return Promise.resolve(EM.get(key) || null);
+    if (!EMP.has(key)) EMP.set(key, (async () => {
+      let c = false;
+      try {
+        const rec = await DB.run('tilesets', 'readonly', st => st.get('pted' + kind + ':' + id));
+        if (rec && rec.blob) { const bm = await createImageBitmap(rec.blob); c = cv(P.W, P.H); ctx(c).drawImage(bm, 0, 0, P.W, P.H); bm.close && bm.close(); }
+      } catch {}
+      if (!EM.has(key)) EM.set(key, c); EMP.delete(key); return EM.get(key) || null;
+    })());
+    return EMP.get(key);
+  }
+  function editedEl(kind, id) {
+    const key = kind + ':' + id;
+    if (EM.has(key)) return EM.get(key) || null;
+    loadEdit(kind, id).then(c => { if (c) paint(); });
+    return null;
+  }
+  const baseMaskOf = (z, v, el) => editedEl('b', v) || (metaOf(z, v).kind === 'ctx' ? cleanMaskOf(z, v, el) : z.maskC);
+  const overMaskOf = v => editedEl('o', v) || overEl(v);
+
+  // the brush itself
+  async function startBrush(z) {
+    const v = sceneOf(z); if (!v) return;
+    try { await loadAll(); } catch {}
+    P.brush = { zid: z.id, v, layer: P.brush && P.brush.zid === z.id ? P.brush.layer : 'b', mode: 'erase', size: P.brush ? P.brush.size : Math.round(Math.max(P.W, P.H) / 40), show: true, undo: [] };
+    if (P.brush.layer === 'o' && !metaOf(z, v).over) P.brush.layer = 'b';
+    P.view = 'result'; renderPanel(); renderStage();
+  }
+  function workingMask() {   // the canvas being painted: your edited copy, made from the current mask the first time
+    const B = P.brush, z = zoneOf(B.zid); if (!z) return null;
+    const key = B.layer + ':' + B.v; let c = EM.get(key);
+    if (c) return c;
+    const src = B.layer === 'b' ? (metaOf(z, B.v).kind === 'ctx' ? cleanMaskOf(z, B.v, picEl(B.v)) : z.maskC) : overEl(B.v);
+    if (!src) { toast('The mask is still loading. Try again in a moment.'); return null; }
+    c = cv(P.W, P.H); ctx(c).drawImage(src, 0, 0, P.W, P.H); EM.set(key, c); return c;
+  }
+  function dab(c, x, y) {
+    const B = P.brush, r = B.size / 2, g = ctx(c), gr = g.createRadialGradient(x, y, r * 0.55, x, y, r);
+    gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.save(); g.globalCompositeOperation = B.mode === 'erase' ? 'destination-out' : 'source-over'; g.fillStyle = gr;
+    g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.restore();
+  }
+  function snapshot(c) {   // a copy for Undo, saved small in the background
+    const B = P.brush, copy = cv(c.width, c.height); copy.getContext('2d').drawImage(c, 0, 0);
+    const item = { layer: B.layer, blob: null, ready: new Promise(res => copy.toBlob(b => { item.blob = b; res(); }, 'image/png')) };
+    B.undo.push(item); if (B.undo.length > 20) B.undo.shift();
+  }
+  let brushSaveT = 0;
+  function saveBrush() {
+    clearTimeout(brushSaveT);
+    const B = P.brush; if (!B) return;
+    const key = B.layer + ':' + B.v, id = 'pted' + B.layer + ':' + B.v;
+    brushSaveT = setTimeout(() => { const c = EM.get(key); if (c) c.toBlob(b => { if (b) DB.put('tilesets', { id, kind: 'ptedit', blob: b }); }, 'image/png'); }, 400);
+  }
+  async function undoBrush() {
+    const B = P.brush; if (!B || !B.undo.length) { toast('Nothing to undo.'); return; }
+    const it = B.undo.pop(); await it.ready; if (!it.blob) return;
+    const bm = await createImageBitmap(it.blob), key = it.layer + ':' + B.v, c = EM.get(key) || cv(P.W, P.H), g = ctx(c);
+    g.globalCompositeOperation = 'source-over'; g.clearRect(0, 0, c.width, c.height); g.drawImage(bm, 0, 0); bm.close && bm.close(); EM.set(key, c);
+    const was = B.layer; B.layer = it.layer; saveBrush(); B.layer = was; paint();
+  }
+  async function resetBrush() {
+    const B = P.brush; if (!B) return;
+    if (!confirm(`Put the ${B.layer === 'b' ? 'window' : 'things-in-front'} mask back the way Portals made it? Your brush changes on it are removed.`)) return;
+    EM.set(B.layer + ':' + B.v, false); await DB.del('tilesets', 'pted' + B.layer + ':' + B.v); B.undo = B.undo.filter(u => u.layer !== B.layer);
+    paint(); toast('Mask reset.');
+  }
+  let brushAt = null;   // where the brush is on the picture, for the outline
   let tmpC = null, tintC = null;
   const TINT = new Map();   // picture id -> the overall colour of that world's light
   function tintOf(z, v, el) {
@@ -326,7 +401,7 @@
     for (const z of ordered()) {
       if (only && !only.includes(z)) continue;
       const v = sceneOf(z); if (!v) continue;
-      const m = metaOf(z, v), el = picEl(v), mk = m.kind === 'ctx' ? cleanMaskOf(z, v, el) : z.maskC;
+      const m = metaOf(z, v), el = picEl(v), mk = baseMaskOf(z, v, el);
       if (!el || !mk) { if (needAll) throw new Error('A window picture is still loading. Try again in a moment.'); continue; }
       tg.globalCompositeOperation = 'source-over'; tg.clearRect(0, 0, w, h);
       if (m.kind === 'ctx') tg.drawImage(el, 0, 0, w, h); else drawCover(tg, el, w, h, z.t);
@@ -340,7 +415,7 @@
           const t2 = tintC.getContext('2d'); t2.globalCompositeOperation = 'source-over'; t2.clearRect(0, 0, w, h);
           t2.fillStyle = `rgb(${col.map(Math.round).join(',')})`; t2.fillRect(0, 0, w, h);
           t2.globalCompositeOperation = 'destination-in'; t2.drawImage(z.archC, 0, 0, w, h);
-          const mo = m.over ? overEl(v) : null; if (mo) { t2.globalCompositeOperation = 'destination-out'; t2.drawImage(mo, 0, 0, w, h); }
+          const mo = m.over ? overMaskOf(v) : null; if (mo) { t2.globalCompositeOperation = 'destination-out'; t2.drawImage(mo, 0, 0, w, h); }
           g.save(); g.globalCompositeOperation = 'soft-light'; g.globalAlpha = Math.min(1, amt); g.drawImage(tintC, 0, 0);
           g.globalCompositeOperation = 'color'; g.globalAlpha = amt * 0.25; g.drawImage(tintC, 0, 0); g.restore();
         }
@@ -349,7 +424,7 @@
     if (!noOver) for (const z of ordered().reverse()) {   // things in front go on top last: the outermost world is nearest the camera
       if (only && !only.includes(z)) continue;
       const v = sceneOf(z); if (!v || !metaOf(z, v).over) continue;
-      const el = picEl(v), mo = overEl(v);
+      const el = picEl(v), mo = overMaskOf(v);
       if (!el || !mo) { if (needAll) throw new Error('A window picture is still loading. Try again in a moment.'); continue; }
       tg.globalCompositeOperation = 'source-over'; tg.clearRect(0, 0, w, h); tg.drawImage(el, 0, 0, w, h);
       tg.globalCompositeOperation = 'destination-in'; tg.drawImage(mo, 0, 0, w, h); if (z.allowC) tg.drawImage(z.allowC, 0, 0, w, h); g.drawImage(tmpC, 0, 0);
@@ -408,7 +483,12 @@
 .pz-ver button:disabled{opacity:.3;cursor:default}
 .pz-refs.over{outline:1px dashed #fff;outline-offset:4px;border-radius:8px}
 .pz-btns{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
-.pt-pick.on{background:#fff;color:#000;border-color:#fff}`;
+.pt-pick.on{background:#fff;color:#000;border-color:#fff}
+.pt-brush{border:1px solid #333;border-radius:10px;padding:10px;margin:0 0 10px;background:#111}
+.pt-brush-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-size:12.5px}
+.pt-brush .seg button.on{background:#fff!important;color:#000!important}
+.pt-brush .slider output{min-width:34px;text-align:right;white-space:nowrap}
+.pt-wrap.brushing canvas{cursor:none}`;
   document.head.appendChild(css);
 
   const panel = document.createElement('aside');
@@ -602,7 +682,7 @@
   }
   function inputFor(z, outer) {   // the picture the AI starts from: the worlds in front, with their cut-out objects taken out, so they are never copied into this world
     const { W, H } = P, comp = compose(W, H, true, outer, true), hole = cv(W, H), hg = ctx(hole); let anyHole = false;
-    for (const o of outer) { const v = sceneOf(o); if (!v || !metaOf(o, v).over) continue; const mo = overEl(v); if (mo) { hg.drawImage(mo, 0, 0, W, H); if (o.allowC) { hg.globalCompositeOperation = 'destination-in'; hg.drawImage(o.allowC, 0, 0, W, H); hg.globalCompositeOperation = 'source-over'; } anyHole = true; } }
+    for (const o of outer) { const v = sceneOf(o); if (!v || !metaOf(o, v).over) continue; const mo = overMaskOf(v); if (mo) { hg.drawImage(mo, 0, 0, W, H); if (o.allowC) { hg.globalCompositeOperation = 'destination-in'; hg.drawImage(o.allowC, 0, 0, W, H); hg.globalCompositeOperation = 'source-over'; } anyHole = true; } }
     if (!anyHole) return comp;
     const k = Math.min(1, 1024 / Math.max(W, H)), sw = Math.round(W * k), sh = Math.round(H * k);
     const small = cv(sw, sh), sg = ctx(small); sg.drawImage(comp, 0, 0, sw, sh); sg.globalCompositeOperation = 'destination-out'; sg.drawImage(hole, 0, 0, sw, sh);
@@ -767,17 +847,17 @@
         const m = metaOf(z, v), el = picEl(v);
         let pic;
         if (m.kind === 'ctx') pic = full(el); else { pic = cv(W, H); drawCover(ctx(pic), el, W, H, z.t); }
-        const L = layerFrom(nm(z, 0, timeOf(z)[1].toLowerCase()), pic, [m.kind === 'ctx' ? cleanMaskOf(z, v, el) : z.maskC]); if (L) kids.push(L);
+        const L = layerFrom(nm(z, 0, timeOf(z)[1].toLowerCase()), pic, [baseMaskOf(z, v, el)]); if (L) kids.push(L);
         const amt = z.tint ?? 0.35, col = m.kind === 'ctx' && z.archC && amt > 0 ? tintOf(z, v, el) : null;
         if (col) {   // the arch colour, as its own soft-light layer you can turn up, down or off
           const t = cv(W, H), tg = ctx(t); tg.fillStyle = `rgb(${col.map(Math.round).join(',')})`; tg.fillRect(0, 0, W, H);
-          const masks = [z.archC]; const mo = m.over ? overEl(v) : null; if (mo) masks.push({ el: mo, out: true });
+          const masks = [z.archC]; const mo = m.over ? overMaskOf(v) : null; if (mo) masks.push({ el: mo, out: true });
           const T = layerFrom(nm(z, 0, 'arch colour'), t, masks, { blend: 'soft light', opacity: Math.min(1, amt) }); if (T) kids.push(T);
         }
       }
       for (const z of ordered().reverse()) {   // the cut-outs in front, nearest the camera on top
         const v = sceneOf(z); if (!v || !metaOf(z, v).over) continue; await yieldUI();
-        const L = layerFrom(nm(z, 0, 'in front (cut-out)'), full(picEl(v)), [overEl(v), z.allowC]); if (L) kids.push(L);
+        const L = layerFrom(nm(z, 0, 'in front (cut-out)'), full(picEl(v)), [overMaskOf(v), z.allowC]); if (L) kids.push(L);
       }
       if (P.blendId && img(P.blendId)) {   // the finished photograph, switched off, on top
         const el = picEl(P.blendId) || await createImageBitmap(await getBlob(img(P.blendId)));
@@ -808,6 +888,14 @@
     if (P.view === 'layout') g.drawImage(P.layoutC, 0, 0, pw, ph);
     else if (P.view === 'final' && P.blendId) { const el = picEl(P.blendId); if (el) g.drawImage(el, 0, 0, pw, ph); }
     else g.drawImage(compose(pw, ph), 0, 0);
+    if (P.brush && P.view === 'result') {
+      const B = P.brush, mk = EM.get(B.layer + ':' + B.v) || (B.layer === 'b' ? baseMaskOf(zoneOf(B.zid) || {}, B.v, picEl(B.v)) : overMaskOf(B.v));
+      if (B.show && mk) {   // the mask being edited, shown in colour on top
+        const o = cv(pw, ph), og = o.getContext('2d'); og.fillStyle = B.layer === 'b' ? 'rgba(0,200,255,0.45)' : 'rgba(255,60,200,0.5)'; og.fillRect(0, 0, pw, ph);
+        og.globalCompositeOperation = 'destination-in'; og.drawImage(mk, 0, 0, pw, ph); g.drawImage(o, 0, 0);
+      }
+      if (brushAt) { const k = pw / P.W; g.save(); g.strokeStyle = '#fff'; g.lineWidth = 1.5; g.setLineDash([4, 3]); g.beginPath(); g.arc(brushAt[0] * k, brushAt[1] * k, B.size / 2 * k, 0, Math.PI * 2); g.stroke(); g.restore(); }
+    }
     shown = { w, h };
     const chips = $q('#ptChips');
     if (chips) {
@@ -831,7 +919,9 @@
       st.innerHTML = '<div class="pt-wrap" id="ptWrap"><canvas id="ptCanvas"></canvas><div class="pt-chips" id="ptChips"></div></div>';
       bindCanvas($q('#ptCanvas'));
     }
+    if (P.brush && (P.brush.zid !== P.sel || !zoneOf(P.brush.zid) || sceneOf(zoneOf(P.brush.zid)) !== P.brush.v)) { P.brush = null; brushAt = null; }
     $q('#ptWrap').classList.toggle('picking', P.picking);
+    $q('#ptWrap').classList.toggle('brushing', !!P.brush && P.view === 'result');
     $q('#ptWrap').classList.toggle('moving', !!(z && sceneOf(z) && metaOf(z, sceneOf(z)).kind === 'own') && P.view === 'result');
     st.querySelectorAll('.pt-busy').forEach(b => b.remove());
     const msg = P.busyMsg || P.blendBusy;
@@ -839,7 +929,22 @@
     paint();
   }
   function bindCanvas(c) {
+    const toPic = (e, b) => [(e.clientX - b.left) / b.width * P.W, (e.clientY - b.top) / b.height * P.H];
+    c.addEventListener('pointermove', e => { if (!P.brush || c.onpointermove) return; brushAt = toPic(e, c.getBoundingClientRect()); paint(); });
+    c.addEventListener('pointerleave', () => { if (P.brush && brushAt) { brushAt = null; paint(); } });
     c.addEventListener('pointerdown', e => {
+      if (P.brush && P.view === 'result') {   // painting the mask
+        const b = c.getBoundingClientRect(), m = workingMask(); if (!m) return;
+        e.preventDefault(); c.setPointerCapture(e.pointerId); snapshot(m);
+        let [lx, ly] = toPic(e, b); dab(m, lx, ly); brushAt = [lx, ly]; paint();
+        c.onpointermove = ev => {
+          const [x, y] = toPic(ev, b), step = Math.max(1, P.brush.size / 5), dd = Math.hypot(x - lx, y - ly);
+          for (let s1 = step; s1 <= dd; s1 += step) dab(m, lx + (x - lx) * s1 / dd, ly + (y - ly) * s1 / dd);
+          if (dd >= step) { lx = x; ly = y; } brushAt = [x, y]; paint();
+        };
+        c.onpointerup = () => { c.onpointermove = null; c.onpointerup = null; saveBrush(); };
+        return;
+      }
       const b = c.getBoundingClientRect(), u = (e.clientX - b.left) / b.width, v = (e.clientY - b.top) / b.height;
       if (P.picking) {
         const x = Math.min(P.W - 1, Math.floor(u * P.W)), y = Math.min(P.H - 1, Math.floor(v * P.H)), i = (y * P.W + x) * 4, col = [P.px[i], P.px[i + 1], P.px[i + 2]];
@@ -881,6 +986,18 @@
         <div class="hint">Drag pictures here from History, or add them from your computer: the real place, a landmark, a mood.</div></div>`;
     if (n) h += `<div class="pz-ver"><button type="button" data-pzv="-1"${z.vi <= 0 ? ' disabled' : ''} title="Earlier version">‹</button><span>Version ${z.vi + 1} of ${n}</span><button type="button" data-pzv="1"${z.vi >= n - 1 ? ' disabled' : ''} title="Later version">›</button><span class="sp-fill" style="flex:1"></span>${own ? '<button type="button" class="linkbtn" data-pzreset style="font-size:12px;width:auto;height:auto;background:none;border:0">Reset position</button>' : ''}</div><div class="pz-btns" style="margin:-2px 0 10px"><button type="button" class="btn small" data-pzcopy="place" title="Copy what you wrote for this window">Copy my description</button><button type="button" class="btn small" data-pzcopy="prompt" title="Copy the whole prompt Portals sent for this version">Copy full prompt</button></div>`;
     if (stale) h += `<div class="hint" style="color:var(--star);margin:-2px 0 10px">${stale.old ? 'Made with the earlier version of Portals, so its arch isn’t part of it. Make it again to paint it into the picture.' : `Made before ${esc(stale.name)} changed, so its light and shadows may not match. Make it again to fit.`}</div>`;
+    const B = P.brush && P.brush.zid === z.id ? P.brush : null;
+    if (sc && !B) h += `<button type="button" class="btn wide" data-pzbrush style="margin:0 0 10px" title="Wipe out or paint back parts of this window with a brush">Edit mask…</button>`;
+    if (sc && B) {
+      const hasOver = !!metaOf(z, sc).over;
+      h += `<div class="pt-brush"><div class="pt-brush-h"><b>Mask brush</b><button type="button" class="btn small" data-pzbrushdone>Done</button></div>
+        ${hasOver ? `<div class="seg" style="grid-template-columns:1fr 1fr;margin-bottom:8px"><button type="button" data-pzlayer="b" class="${B.layer === 'b' ? 'on' : ''}">This window</button><button type="button" data-pzlayer="o" class="${B.layer === 'o' ? 'on' : ''}">Things in front</button></div>` : ''}
+        <div class="seg" style="grid-template-columns:1fr 1fr;margin-bottom:8px"><button type="button" data-pzmode="erase" class="${B.mode === 'erase' ? 'on' : ''}">Erase</button><button type="button" data-pzmode="restore" class="${B.mode === 'restore' ? 'on' : ''}">Restore</button></div>
+        <label class="slider v"><span>Brush size</span><input type="range" data-pzbsize min="4" max="${Math.round(Math.max(P.W, P.H) / 6)}" step="1" value="${B.size}"><output>${B.size}</output></label>
+        <label class="check" style="margin:2px 0 8px"><input type="checkbox" data-pzbshow${B.show ? ' checked' : ''}> Show the mask in colour</label>
+        <div class="pz-btns"><button type="button" class="btn small" data-pzbundo>Undo</button><button type="button" class="btn small" data-pzbreset>Reset mask</button></div>
+        <div class="hint" style="margin-top:6px">${B.layer === 'b' ? 'Erase hides this window’s picture there, so what’s behind shows. Restore paints it back.' : 'Erase takes things out of the cut-out (they stop passing over the windows further in). Restore paints the cut-out back.'} Changes save by themselves.</div></div>`;
+    }
     if (own) h += `
 <label class="slider v"><span>Size</span><input type="range" data-pzsize min="100" max="300" step="1" value="${Math.round((z.t.s || 1) * 100)}"><output>${Math.round((z.t.s || 1) * 100)}%</output></label>
       <div class="hint" style="margin:-2px 0 10px">Drag inside the window on the picture to slide the scene.</div>`;
@@ -933,6 +1050,8 @@
     if (t.id === 'ptGrow') { t.nextElementSibling.textContent = t.value + ' px'; return; }
     if (t.dataset.pzover !== undefined && z) { z.overlap = t.checked; save(); return; }
     if (t.dataset.pzfront !== undefined && z) { z.front = t.value; save(); return; }
+    if (t.dataset.pzbsize !== undefined && P.brush) { P.brush.size = +t.value; t.nextElementSibling.textContent = t.value; paint(); return; }
+    if (t.dataset.pzbshow !== undefined && P.brush) { P.brush.show = t.checked; paint(); return; }
     if (t.dataset.pztint !== undefined && z) { z.tint = +t.value / 100; t.nextElementSibling.textContent = t.value + '%'; paint(); save(); return; }
     if (t.dataset.pzsize !== undefined && z) { z.t = { ...z.t, s: +t.value / 100 }; t.nextElementSibling.textContent = t.value + '%'; paint(); save(); }
   });
@@ -963,6 +1082,12 @@
     if (t.closest('[data-pzown]')) { fileFor = { kind: 'scene', zone: z.id }; fileIn.multiple = false; fileIn.value = ''; fileIn.click(); return; }
     const v = t.closest('[data-pzv]'); if (v) { z.vi = Math.max(0, Math.min(z.versions.length - 1, z.vi + +v.dataset.pzv)); z.t = { x: 0, y: 0, s: 1 }; save(); renderPanel(); renderStage(); return; }
     if (t.closest('[data-pzreset]')) { z.t = { x: 0, y: 0, s: 1 }; save(); renderPanel(); paint(); return; }
+    if (t.closest('[data-pzbrush]')) { startBrush(z); return; }
+    if (t.closest('[data-pzbrushdone]')) { P.brush = null; brushAt = null; renderPanel(); renderStage(); return; }
+    const ly = t.closest('[data-pzlayer]'); if (ly && P.brush) { P.brush.layer = ly.dataset.pzlayer; renderPanel(); paint(); return; }
+    const md = t.closest('[data-pzmode]'); if (md && P.brush) { P.brush.mode = md.dataset.pzmode; renderPanel(); return; }
+    if (t.closest('[data-pzbundo]')) { undoBrush(); return; }
+    if (t.closest('[data-pzbreset]')) { resetBrush(); return; }
     if (t.closest('[data-pzgo]')) { makeZone(z); return; }
     const cp = t.closest('[data-pzcopy]');
     if (cp) {
