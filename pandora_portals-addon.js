@@ -236,9 +236,35 @@
         }
         if (!anchored) for (let k = 0; k < t; k++) a[q[k]] = 0;
       }
+      fillHoles(a, W, H);
     }
     for (let i = 0; i < n; i++) { const j = i * 4; d[j] = d[j + 1] = d[j + 2] = 255; d[j + 3] = a[i]; }
     g.putImageData(id, 0, 0); return c;
+  }
+  /* Gaps inside a thing in front (a car's bonnet, the people in it) are filled, so nothing behind shows through it.
+     Only small, fully enclosed gaps: never a whole window, never the open space around an arch. */
+  function fillHoles(a, W, H) {
+    const n = W * H, out = new Uint8Array(n), q = new Int32Array(n), L = P.labels, Z = P.zones.length, area = new Int32Array(Z + 1);
+    for (let i = 0; i < n; i++) area[L[i]]++;
+    let h = 0, t = 0; const push = i => { if (!out[i] && a[i] < 128) { out[i] = 1; q[t++] = i; } };
+    for (let x = 0; x < W; x++) { push(x); push((H - 1) * W + x); }
+    for (let y = 0; y < H; y++) { push(y * W); push(y * W + W - 1); }
+    while (h < t) { const i = q[h++], x = i % W; if (x > 0) push(i - 1); if (x < W - 1) push(i + 1); if (i >= W) push(i - W); if (i < n - W) push(i + W); }
+    const seen = new Uint8Array(n), cnt = new Int32Array(Z + 1);
+    for (let s0 = 0; s0 < n; s0++) {
+      if (a[s0] >= 128 || out[s0] || seen[s0]) continue;
+      let hh = 0, tt = 0; seen[s0] = 1; q[tt++] = s0; cnt.fill(0);
+      while (hh < tt) {
+        const i = q[hh++], x = i % W; cnt[L[i]]++;
+        if (x > 0 && !seen[i - 1] && !out[i - 1] && a[i - 1] < 128) { seen[i - 1] = 1; q[tt++] = i - 1; }
+        if (x < W - 1 && !seen[i + 1] && !out[i + 1] && a[i + 1] < 128) { seen[i + 1] = 1; q[tt++] = i + 1; }
+        if (i >= W && !seen[i - W] && !out[i - W] && a[i - W] < 128) { seen[i - W] = 1; q[tt++] = i - W; }
+        if (i < n - W && !seen[i + W] && !out[i + W] && a[i + W] < 128) { seen[i + W] = 1; q[tt++] = i + W; }
+      }
+      let ok = tt < n * 0.02;
+      for (let k = 1; k <= Z && ok; k++) if (area[k] && cnt[k] > area[k] * 0.5) ok = false;
+      if (ok) for (let k = 0; k < tt; k++) a[q[k]] = 255;
+    }
   }
   /* Leftover placeholder colour (a red or green line along an arch) in a world's picture, next to the windows further in:
      taken out, so the stone shows there instead. */
@@ -889,7 +915,7 @@
       <div class="pt-step${any ? '' : ' off'}"><h4><i>4</i>Finish</h4>
         <label class="field"><span class="lbl">Anything to add across the picture <small>optional</small></span><textarea id="ptNotes" rows="2" placeholder="e.g. a dune buggy driving out of the left arch, kicking up sand">${esc(P.notes)}</textarea></label>
         <div class="up-src${P.editedId && img(P.editedId) ? '' : ' empty'}" style="margin-bottom:8px">${P.editedId && img(P.editedId) ? `<img src="${thumb(img(P.editedId))}" alt=""><div><b>Using your edited version</b><span>${esc(img(P.editedId).name || '')} · <button type="button" class="linkbtn" id="ptEdOff" style="font-size:11.5px">stop using it</button></span></div>` : 'Using the windows as they are'}</div>
-        <button type="button" class="btn wide" id="ptEdUp" style="margin:0 0 10px" title="Bring back your amended PSD (or a PNG or JPG of it) and make the final photograph from that">Upload my edited version (PSD, PNG or JPG)…</button>
+        <button type="button" class="btn wide" id="ptEdUp" style="margin:0 0 10px" title="Bring back your amended PSD (or a PNG or JPG of it) and make the final photograph from that">Upload my edited version…</button><div class="hint" style="margin:-6px 0 10px">A PSD, PNG or JPG of your retouched picture.</div>
         <label class="field"><span class="lbl">Final size</span><select id="ptFinal">${(MODELS.find(x => x.id === settings.ptModel) || MODELS[0]).sizes.map(sz => `<option${sz === (settings.ptFinal || '4K') ? ' selected' : ''}>${sz}</option>`).join('')}</select></label>
         <button type="button" class="primary" id="ptBlend"${P.blendBusy ? ' disabled' : ''}>${P.blendBusy ? 'Working…' : 'Make it one photograph'}<small>about ${usd((PRICES[settings.ptModel] || {})[settings.ptFinal || '4K'] || price())} · lights the stone and blends the edges</small></button>
         <button type="button" class="btn wide" id="ptSave">Save it as it is (free)</button>
