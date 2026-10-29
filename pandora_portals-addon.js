@@ -179,7 +179,7 @@
     for (const z of P.zones) {
       const v = sceneOf(z); if (!v) continue;
       if (!EL.get(v)) jobs.push(load(EL, 'p:' + v, async () => createImageBitmap(await getBlob(img(v)))));
-      if (metaOf(z, v).over && !MO.get(v)) jobs.push(load(MO, 'o:' + v, async () => { const rec = await DB.run('tilesets', 'readonly', st => st.get('ptover:' + v)); return rec && rec.blob ? createImageBitmap(rec.blob) : null; }));
+      if (metaOf(z, v).over && !MO.get(v)) jobs.push(load(MO, 'o:' + v, async () => { const rec = await DB.run('tilesets', 'readonly', st => st.get('ptover:' + v)); return rec && rec.blob ? fixOver(await createImageBitmap(rec.blob), v) : null; }));
       if (metaOf(z, v).kind === 'ctx' && !MK.get(v)) jobs.push(load(MK, 'm:' + v, async () => { const rec = await DB.run('tilesets', 'readonly', st => st.get('ptmask:' + v)); return rec && rec.blob ? createImageBitmap(rec.blob) : null; }));
     }
     await Promise.all(jobs);
@@ -201,7 +201,7 @@
   function overEl(id) {
     if (MO.has(id)) return MO.get(id) || null;
     MO.set(id, null);
-    (async () => { try { const rec = await DB.run('tilesets', 'readonly', st => st.get('ptover:' + id)); if (rec && rec.blob) MO.set(id, await createImageBitmap(rec.blob)); } catch {} paint(); })();
+    (async () => { try { const rec = await DB.run('tilesets', 'readonly', st => st.get('ptover:' + id)); if (rec && rec.blob) MO.set(id, fixOver(await createImageBitmap(rec.blob), id)); } catch {} paint(); })();
     return null;
   }
   const MK = new Map();   // picture id -> its window mask
@@ -210,6 +210,72 @@
     MK.set(id, null);
     (async () => { try { const rec = await DB.run('tilesets', 'readonly', st => st.get('ptmask:' + id)); if (rec && rec.blob) MK.set(id, await createImageBitmap(rec.blob)); else MK.delete(id); } catch { MK.delete(id); } paint(); })();
     return null;
+  }
+
+  /* ---------------- cleaning up the masks (applied when a picture is shown, so existing work improves too) ---------------- */
+  const zoneOfPic = v => P.zones.find(z => z.versions.includes(v)) || null;
+  /* Things in front (a car, a person): solid inside with a soft edge, never see-through. And only things that stand in this
+     window's own world are kept: loose pieces elsewhere (for example this world's copy of an arch further in) are dropped. */
+  function fixOver(bm, v) {
+    const { W, H } = P; if (!W || !H) return bm;
+    const c = cv(W, H), g = ctx(c); g.imageSmoothingQuality = 'high'; g.drawImage(bm, 0, 0, W, H); bm.close && bm.close();
+    const id = g.getImageData(0, 0, W, H), d = id.data, n = W * H, a = new Uint8Array(n);
+    for (let i = 0; i < n; i++) { const x = d[i * 4 + 3], t = Math.min(1, Math.max(0, (x - 50) / 100)); a[i] = Math.round(255 * t * t * (3 - 2 * t)); }
+    const z = zoneOfPic(v);
+    if (z && P.labels) {
+      const inner = innerRegion(z), comp = new Int32Array(n), q = new Int32Array(n); let next = 0;
+      for (let s0 = 0; s0 < n; s0++) {
+        if (a[s0] < 20 || comp[s0]) continue;
+        next++; let h = 0, t = 0, anchored = false; comp[s0] = next; q[t++] = s0;
+        while (h < t) {
+          const i = q[h++], x = i % W; if (!inner[i]) anchored = true;
+          if (x > 0 && !comp[i - 1] && a[i - 1] >= 20) { comp[i - 1] = next; q[t++] = i - 1; }
+          if (x < W - 1 && !comp[i + 1] && a[i + 1] >= 20) { comp[i + 1] = next; q[t++] = i + 1; }
+          if (i >= W && !comp[i - W] && a[i - W] >= 20) { comp[i - W] = next; q[t++] = i - W; }
+          if (i < n - W && !comp[i + W] && a[i + W] >= 20) { comp[i + W] = next; q[t++] = i + W; }
+        }
+        if (!anchored) for (let k = 0; k < t; k++) a[q[k]] = 0;
+      }
+    }
+    for (let i = 0; i < n; i++) { const j = i * 4; d[j] = d[j + 1] = d[j + 2] = 255; d[j + 3] = a[i]; }
+    g.putImageData(id, 0, 0); return c;
+  }
+  /* Leftover placeholder colour (a red or green line along an arch) in a world's picture, next to the windows further in:
+     taken out, so the stone shows there instead. */
+  const CLEAN = new Map();
+  function cleanMaskOf(z, v, el) {
+    const mk = maskEl(v); if (!mk || !el) return mk;
+    if (CLEAN.has(v)) return CLEAN.get(v);
+    const inner = innerOf(z); if (!inner.length || !P.labels) { CLEAN.set(v, mk); return mk; }
+    const { W, H } = P, n = W * H, mc = cv(W, H), mg = ctx(mc); mg.drawImage(mk, 0, 0, W, H);
+    const pc = cv(W, H), pg = ctx(pc); pg.drawImage(el, 0, 0, W, H);
+    const md = mg.getImageData(0, 0, W, H), pp = pg.getImageData(0, 0, W, H).data, R = Math.max(5, Math.round(Math.max(W, H) / 200));
+    const hsv = (r, g2, b) => { const mx = Math.max(r, g2, b), mn = Math.min(r, g2, b), dd = mx - mn; let h = 0;
+      if (dd) h = mx === r ? ((g2 - b) / dd) % 6 : mx === g2 ? (b - r) / dd + 2 : (r - g2) / dd + 4; return [(h * 60 + 360) % 360, mx ? dd / mx : 0, mx]; };
+    let changed = 0;
+    for (const o of inner) {
+      const k = P.zones.indexOf(o) + 1; let near = new Uint8Array(n); const hist = new Map();
+      for (let i = 0; i < n; i++) if (P.labels[i] === k) { near[i] = 255; const j = i * 4, key = (pp[j] >> 4) << 8 | (pp[j + 1] >> 4) << 4 | (pp[j + 2] >> 4), hh = hist.get(key) || [0, 0, 0, 0]; hh[0]++; hh[1] += pp[j]; hh[2] += pp[j + 1]; hh[3] += pp[j + 2]; hist.set(key, hh); }
+      let b = [0, 0, 0, 0]; for (const hh of hist.values()) if (hh[0] > b[0]) b = hh;
+      const est = b[0] ? [b[1] / b[0], b[2] / b[0], b[3] / b[0]] : o.color, ph = hsv(...o.color);
+      let x0 = W, y0 = H, x1 = -1, y1 = -1;   // only the area round this window, so it stays quick
+      for (let i = 0; i < n; i++) if (near[i]) { const x = i % W, y = (i / W) | 0; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+      if (x1 < 0) continue;
+      x0 = Math.max(0, x0 - R); y0 = Math.max(0, y0 - R); x1 = Math.min(W - 1, x1 + R); y1 = Math.min(H - 1, y1 + R);
+      const cw = x1 - x0 + 1, ch = y1 - y0 + 1; let crop = new Uint8Array(cw * ch);
+      for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) crop[y * cw + x] = near[(y + y0) * W + x + x0];
+      crop = dilate(crop, cw, ch, R);
+      for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+        const i = (y + y0) * W + x + x0;
+        if (!crop[y * cw + x] || md.data[i * 4 + 3] === 0) continue;
+        const j = i * 4, r = pp[j], g2 = pp[j + 1], bb = pp[j + 2];
+        const d1 = (r - o.color[0]) ** 2 + (g2 - o.color[1]) ** 2 + (bb - o.color[2]) ** 2, d2 = (r - est[0]) ** 2 + (g2 - est[1]) ** 2 + (bb - est[2]) ** 2;
+        const [hu, sa, va] = hsv(r, g2, bb), dh = Math.min(Math.abs(hu - ph[0]), 360 - Math.abs(hu - ph[0]));
+        if (d1 < 80 * 80 || d2 < 50 * 50 || (ph[1] > 0.5 && sa > 0.55 && va > 60 && dh < 24)) { md.data[j + 3] = 0; changed++; }
+      }
+    }
+    if (!changed) { CLEAN.set(v, mk); return mk; }
+    mg.putImageData(md, 0, 0); CLEAN.set(v, mc); return mc;
   }
   let tmpC = null, tintC = null;
   const TINT = new Map();   // picture id -> the overall colour of that world's light
@@ -234,7 +300,7 @@
     for (const z of ordered()) {
       if (only && !only.includes(z)) continue;
       const v = sceneOf(z); if (!v) continue;
-      const m = metaOf(z, v), el = picEl(v), mk = m.kind === 'ctx' ? maskEl(v) : z.maskC;
+      const m = metaOf(z, v), el = picEl(v), mk = m.kind === 'ctx' ? cleanMaskOf(z, v, el) : z.maskC;
       if (!el || !mk) { if (needAll) throw new Error('A window picture is still loading. Try again in a moment.'); continue; }
       tg.globalCompositeOperation = 'source-over'; tg.clearRect(0, 0, w, h);
       if (m.kind === 'ctx') tg.drawImage(el, 0, 0, w, h); else drawCover(tg, el, w, h, z.t);
@@ -266,7 +332,7 @@
   }
 
   /* ---------------- UI shell ---------------- */
-  const ICON = '<path d="M4 21V10a5 5 0 0 1 5-5h0a5 5 0 0 1 5 5v11"/><path d="M14 21V12a3.5 3.5 0 0 1 7 0v9"/><path d="M3 21h19"/><path d="M7 13.5c1.2-.8 2.8-.8 4 0"/>';
+  const ICON = '<path d="M7 21V8.5a5 5 0 0 1 10 0V21"/>';
   const icoS = (d, n) => `<svg viewBox="0 0 24 24" width="${n || 20}" height="${n || 20}" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
   const tab = document.createElement('button');
   tab.className = 'tab'; tab.dataset.view = 'portals'; tab.title = 'A different place and time of day in every window';
@@ -420,6 +486,7 @@
       + (style ? `Overall look for the whole campaign: ${style}. ` : '')
       + (nRefs ? `Image${nRefs > 1 ? 's' : ''} 2${nRefs > 1 ? ' to ' + (nRefs + 1) : ''} ${nRefs > 1 ? 'are reference photos' : 'is a reference photo'} of the real place for this ${cn} area. Recreate that place faithfully, as seen from this camera: its buildings, landmarks, landscape, materials, colours and details must match the reference closely, not a generic version of it. Only image 1 sets the composition, the arches and the framing; the reference${nRefs > 1 ? 's do' : ' does'} not. ` : '')
       + (outer ? `Depth: this ${cn} area is ${outer} arch${outer > 1 ? 'es' : ''} further back than the outermost scene, so everything in it is further from the camera. People, animals, vehicles and objects here must look clearly smaller than the same things in the scene${outer > 1 ? 's' : ''} in front of it, about ${Math.round(Math.pow(0.65, outer) * 100)}% of their size in the outermost scene, with matching perspective and slightly softer detail. ` : '')
+      + 'Do not add anything on top of or around any arch (no spires, domes, finials, carvings or extra stone): every arch keeps exactly the outline it has in image 1. '
       + 'Same framing and size as image 1. No text or logos. A clean, real, high-end photograph.';
   }
   function innerRegion(z) {   // the windows further in, with everything inside them
@@ -563,7 +630,7 @@
       const masks = await stepMasks(z, og.getImageData(0, 0, W, H).data, fg);
       const rec = await addImage({ id: uid(), projectId: S.projectId || null, groupId: null, blob, mime: 'image/jpeg',
         name: slug(z.place.slice(0, 40)) + '-window', source: 'generated', fav: false, createdAt: Date.now(),
-        recipe: { kind: 'portals', model, prompt, ratio: r0, size, refs: refIds, window: z.name, time: timeOf(z)[1] } });
+        recipe: { kind: 'portals', model, prompt, ratio: r0, size, refs: refIds, window: z.name, time: timeOf(z)[1], place: z.place, style: P.style, front: z.front || '' } });
       await DB.put('tilesets', { id: 'ptmask:' + rec.id, kind: 'ptmask', blob: masks.base });
       if (masks.over) await DB.put('tilesets', { id: 'ptover:' + rec.id, kind: 'ptmask', blob: masks.over });
       z.meta = z.meta || {}; z.meta[rec.id] = { kind: 'ctx', over: !!masks.over, on: Object.fromEntries(outer.map(o => [o.id, sceneOf(o) || null])) };
@@ -674,7 +741,7 @@
         const m = metaOf(z, v), el = picEl(v);
         let pic;
         if (m.kind === 'ctx') pic = full(el); else { pic = cv(W, H); drawCover(ctx(pic), el, W, H, z.t); }
-        const L = layerFrom(nm(z, 0, timeOf(z)[1].toLowerCase()), pic, [m.kind === 'ctx' ? maskEl(v) : z.maskC]); if (L) kids.push(L);
+        const L = layerFrom(nm(z, 0, timeOf(z)[1].toLowerCase()), pic, [m.kind === 'ctx' ? cleanMaskOf(z, v, el) : z.maskC]); if (L) kids.push(L);
         const amt = z.tint ?? 0.35, col = m.kind === 'ctx' && z.archC && amt > 0 ? tintOf(z, v, el) : null;
         if (col) {   // the arch colour, as its own soft-light layer you can turn up, down or off
           const t = cv(W, H), tg = ctx(t); tg.fillStyle = `rgb(${col.map(Math.round).join(',')})`; tg.fillRect(0, 0, W, H);
@@ -786,7 +853,7 @@
         <div class="fx-refs">${z.refs.filter(id => img(id)).map(id => `<div class="r"><img src="${thumb(img(id))}" data-th="${id}" alt=""><button type="button" data-pzrefx="${id}" title="Remove">×</button></div>`).join('')}</div>
         <div class="row" style="margin-top:6px"><button type="button" class="btn small" data-pzrefadd>Add picture…</button></div>
         <div class="hint">Drag pictures here from History, or add them from your computer: the real place, a landmark, a mood.</div></div>`;
-    if (n) h += `<div class="pz-ver"><button type="button" data-pzv="-1"${z.vi <= 0 ? ' disabled' : ''} title="Earlier version">‹</button><span>Version ${z.vi + 1} of ${n}</span><button type="button" data-pzv="1"${z.vi >= n - 1 ? ' disabled' : ''} title="Later version">›</button><span class="sp-fill" style="flex:1"></span>${own ? '<button type="button" class="linkbtn" data-pzreset style="font-size:12px;width:auto;height:auto;background:none;border:0">Reset position</button>' : ''}</div>`;
+    if (n) h += `<div class="pz-ver"><button type="button" data-pzv="-1"${z.vi <= 0 ? ' disabled' : ''} title="Earlier version">‹</button><span>Version ${z.vi + 1} of ${n}</span><button type="button" data-pzv="1"${z.vi >= n - 1 ? ' disabled' : ''} title="Later version">›</button><span class="sp-fill" style="flex:1"></span>${own ? '<button type="button" class="linkbtn" data-pzreset style="font-size:12px;width:auto;height:auto;background:none;border:0">Reset position</button>' : ''}</div><div class="pz-btns" style="margin:-2px 0 10px"><button type="button" class="btn small" data-pzcopy="place" title="Copy what you wrote for this window">Copy my description</button><button type="button" class="btn small" data-pzcopy="prompt" title="Copy the whole prompt Portals sent for this version">Copy full prompt</button></div>`;
     if (stale) h += `<div class="hint" style="color:var(--star);margin:-2px 0 10px">${stale.old ? 'Made with the earlier version of Portals, so its arch isn’t part of it. Make it again to paint it into the picture.' : `Made before ${esc(stale.name)} changed, so its light and shadows may not match. Make it again to fit.`}</div>`;
     if (own) h += `
 <label class="slider v"><span>Size</span><input type="range" data-pzsize min="100" max="300" step="1" value="${Math.round((z.t.s || 1) * 100)}"><output>${Math.round((z.t.s || 1) * 100)}%</output></label>
@@ -871,6 +938,14 @@
     const v = t.closest('[data-pzv]'); if (v) { z.vi = Math.max(0, Math.min(z.versions.length - 1, z.vi + +v.dataset.pzv)); z.t = { x: 0, y: 0, s: 1 }; save(); renderPanel(); renderStage(); return; }
     if (t.closest('[data-pzreset]')) { z.t = { x: 0, y: 0, s: 1 }; save(); renderPanel(); paint(); return; }
     if (t.closest('[data-pzgo]')) { makeZone(z); return; }
+    const cp = t.closest('[data-pzcopy]');
+    if (cp) {
+      const r = img(sceneOf(z)), rc = (r && r.recipe) || {};
+      const txt = cp.dataset.pzcopy === 'place' ? (rc.place || z.place || '') : (rc.prompt || '');
+      if (!txt.trim()) { toast(cp.dataset.pzcopy === 'place' ? 'This window has no description yet.' : 'This version has no saved prompt (it’s your own picture).'); return; }
+      navigator.clipboard.writeText(txt.trim()).then(() => toast('Copied.'), () => toast('Couldn’t copy. Open the picture in History and copy it from there.'));
+      return;
+    }
     if (t.closest('[data-pzrm]')) { const v = sceneOf(z); z.versions.splice(z.vi, 1); if (z.meta) delete z.meta[v]; z.vi = z.versions.length - 1; if (P.blendId) P.view = 'result'; save(); renderPanel(); renderStage(); toast(`Picture removed from ${z.name}. It’s still in History.`); return; }
     if (t.closest('[data-pzdel]')) { if (sceneOf(z) && !confirm(`Remove ${z.name}? Its pictures stay in History.`)) return; P.zones = P.zones.filter(x => x !== z); P.sel = P.zones[0] ? P.zones[0].id : null; rebuild('Updating the windows…'); }
   });
